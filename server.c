@@ -1,4 +1,5 @@
 #include <rdma/rdma_cma.h>
+#include <rdma/rdma_verbs.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,7 +37,7 @@ int main(int argc, char **argv) {
   hints.ai_port_space = RDMA_PS_UDP;
   hints.ai_flags = RAI_PASSIVE;
   struct rdma_addrinfo *rai;
-  ret = rdma_getaddrinfo("192.168.97.111", "7174", &hints, &rai);
+  ret = rdma_getaddrinfo("192.168.97.111", "17174", &hints, &rai);
   if (ret) {
     fprintf(stderr, "rdma_getaddrinfo failed\n");
     goto out;
@@ -62,7 +63,6 @@ int main(int argc, char **argv) {
       // handle connect
       if (event->event == RDMA_CM_EVENT_CONNECT_REQUEST) {
         printf("got connect request\n");
-        struct rdma_conn_param conn_param = {};
 
         // init queues
         ctx->pd = ibv_alloc_pd(event->id->verbs);
@@ -88,70 +88,65 @@ int main(int argc, char **argv) {
         init_qp_attr.recv_cq = ctx->cq;
         init_qp_attr.qp_type = IBV_QPT_UD;
         init_qp_attr.sq_sig_all = 0;
-        ctx->qp = ibv_create_qp(ctx->pd, &init_qp_attr);
-        if (!ctx->qp) {
+        ret = rdma_create_qp(event->id, ctx->pd, &init_qp_attr);
+        if (ret) {
           fprintf(stderr, "ibv_create_qp failed\n");
           goto out;
         }
+        ctx->qp = event->id->qp;
 
-        ctx->recv_region = malloc(1024);
+        ctx->recv_region = malloc(1024 + sizeof(struct ibv_grh));
         if (!ctx->recv_region) {
           fprintf(stderr, "malloc failed\n");
           goto out;
         }
 
         ctx->recv_mr =
-            ibv_reg_mr(ctx->pd, ctx->recv_region, 1024, IBV_ACCESS_LOCAL_WRITE);
+            ibv_reg_mr(ctx->pd, ctx->recv_region, 1024 + sizeof(struct ibv_grh),
+                       IBV_ACCESS_LOCAL_WRITE);
         if (!ctx->recv_mr) {
           fprintf(stderr, "ibv_reg_mr failed\n");
           goto out;
         }
 
-        struct ibv_sge sge = {};
-        sge.addr = (uintptr_t)ctx->recv_region;
-        sge.length = 1024;
-        sge.lkey = ctx->recv_mr->lkey;
-
-        struct ibv_recv_wr recv_wr = {
-            .wr_id = (uintptr_t)ctx,
-            .sg_list = &sge,
-            .num_sge = 1,
-            .next = NULL,
-        };
-        struct ibv_recv_wr *bad_recv_wr;
-
-        ret = ibv_post_recv(ctx->qp, &recv_wr, &bad_recv_wr);
+        ret = rdma_post_recv(event->id, ctx, ctx->recv_region,
+                             1024 + sizeof(struct ibv_grh), ctx->recv_mr);
         if (ret) {
-          fprintf(stderr, "ibv_post_recv failed\n");
+          fprintf(stderr, "rdma_post_recv failed\n");
           goto out;
         }
 
-        /* start to receive */
+        struct rdma_conn_param conn_param = {};
+        conn_param.qp_num = event->id->qp->qp_num;
         ret = rdma_accept(event->id, &conn_param);
         if (ret) {
           fprintf(stderr, "rdma_accept failed\n");
           goto out;
         }
 
-        /* poll received */
-        while (1) {
-          struct ibv_wc wc;
+        printf("Accepted, start receiving...\n");
+
+        /* poll cq */
+        struct ibv_wc wc;
+        do {
           ret = ibv_poll_cq(ctx->cq, 1, &wc);
-          if (ret == 0) {
-            fprintf(stderr, "ibv_poll_cq returned 0\n");
-            goto out;
-          }
-          if (wc.status != IBV_WC_SUCCESS) {
-            fprintf(stderr, "ibv_poll_cq returned error\n");
-            goto out;
-          }
-          if (wc.opcode == IBV_WC_RECV) {
-            /* received */
-            /* read the buffer */
-            char *buf = (char *)ctx->recv_region;
-            printf("Received: %s\n", buf);
-            goto out;
-          }
+        } while (ret == 0);
+        if (ret < 0) {
+          fprintf(stderr, "ibv_poll_cq failed\n");
+          goto out;
+        }
+        if (wc.status != IBV_WC_SUCCESS) {
+          fprintf(stderr, "Work completion error: %s\n",
+                  ibv_wc_status_str(wc.status));
+          /* check more info */
+          fprintf(stderr, "wc.vendor_error = 0x%x, wc.qp_num = %u\n",
+                  wc.vendor_err, wc.qp_num);
+        }
+        if (wc.opcode == IBV_WC_RECV) {
+          /* read the buffer */
+          char *buf = (char *)ctx->recv_region + sizeof(struct ibv_grh);
+          printf("Received: %s\n", buf);
+          goto out;
         }
       }
       rdma_ack_cm_event(event);
@@ -159,10 +154,11 @@ int main(int argc, char **argv) {
   }
 
 out:
-  if (ctx->recv_region)
-    free(ctx->recv_region);
+
   if (ctx->recv_mr)
     ibv_dereg_mr(ctx->recv_mr);
+  if (ctx->recv_region)
+    free(ctx->recv_region);
   if (ctx->qp)
     ibv_destroy_qp(ctx->qp);
   if (ctx->pd)

@@ -1,4 +1,5 @@
 #include <rdma/rdma_cma.h>
+#include <rdma/rdma_verbs.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -9,7 +10,6 @@ struct ctx {
   struct ibv_context *ctx;
   struct ibv_pd *pd;
   struct ibv_cq *cq;
-  struct ibv_qp *qp;
   struct ibv_ah *ah;
   uint32_t remote_qpn;
   uint32_t remote_qkey;
@@ -47,7 +47,7 @@ int main(int argc, char **argv) {
   hints.ai_src_addr = res->ai_src_addr;
   hints.ai_src_len = res->ai_src_len;
   hints.ai_flags &= ~RAI_PASSIVE;
-  ret = rdma_getaddrinfo("192.168.97.111", "7174", &hints, &rai);
+  ret = rdma_getaddrinfo("192.168.97.111", "17174", &hints, &rai);
   if (ret) {
     fprintf(stderr, "rdma_getaddrinfo failed\n");
     goto out;
@@ -102,8 +102,8 @@ int main(int argc, char **argv) {
         init_qp_attr.recv_cq = ctx->cq;
         init_qp_attr.qp_type = IBV_QPT_UD;
         init_qp_attr.sq_sig_all = 0;
-        ctx->qp = ibv_create_qp(ctx->pd, &init_qp_attr);
-        if (!ctx->qp) {
+        ret = rdma_create_qp(ctx->cma_id, ctx->pd, &init_qp_attr);
+        if (ret) {
           fprintf(stderr, "ibv_create_qp failed\n");
           goto out;
         }
@@ -158,35 +158,17 @@ int main(int argc, char **argv) {
     }
   }
 
-  /* post send */
-  struct ibv_send_wr send_wr, *bad_send_wr;
-  struct ibv_sge sge;
-
-  if (!ctx->connected)
-    return 0;
-
-  send_wr.next = NULL;
-  send_wr.sg_list = &sge;
-  send_wr.num_sge = 1;
-  send_wr.opcode = IBV_WR_SEND;
-  send_wr.send_flags = 0;
-  send_wr.wr_id = (unsigned long)ctx;
-
-  send_wr.wr.ud.ah = ctx->ah;
-  send_wr.wr.ud.remote_qpn = ctx->remote_qpn;
-  send_wr.wr.ud.remote_qkey = ctx->remote_qkey;
-
-  sge.length = 1024;
-  sge.lkey = ctx->send_mr->lkey;
-  sge.addr = (uintptr_t)ctx->send_region;
-
   /* write something to send region, use safe api */
   memset(ctx->send_region, 0, 1024);
   strncpy((char *)ctx->send_region, "Hello from client", 1024);
-
-  ret = ibv_post_send(ctx->qp, &send_wr, &bad_send_wr);
+  if (!ctx->connected)
+    return 0;
+  printf("Post send\n");
+  ret =
+      rdma_post_ud_send(ctx->cma_id, ctx, ctx->send_region, 1024, ctx->send_mr,
+                        IBV_SEND_SIGNALED, ctx->ah, ctx->remote_qpn);
   if (ret) {
-    fprintf(stderr, "ibv_post_send failed\n");
+    fprintf(stderr, "rdma_post_send failed\n");
     goto out;
   }
 
@@ -199,6 +181,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "ibv_poll_cq failed\n");
     goto out;
   }
+  if (wc.opcode == IBV_WC_SEND && wc.status == IBV_WC_SUCCESS)
+    printf("Send done\n");
 
 out:
   if (ctx->ah)
@@ -207,8 +191,8 @@ out:
     ibv_dereg_mr(ctx->send_mr);
   if (ctx->send_region)
     free(ctx->send_region);
-  if (ctx->qp)
-    ibv_destroy_qp(ctx->qp);
+  if (ctx->cma_id->qp)
+    rdma_destroy_qp(ctx->cma_id);
   if (ctx->pd)
     ibv_dealloc_pd(ctx->pd);
   if (rai)

@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+const int BUFFER_SIZE = 100;
+
 struct ctx {
   struct rdma_event_channel *ec;
   struct rdma_cm_id *cma_id;
@@ -47,7 +49,7 @@ int main(int argc, char **argv) {
   hints.ai_src_addr = res->ai_src_addr;
   hints.ai_src_len = res->ai_src_len;
   hints.ai_flags &= ~RAI_PASSIVE;
-  ret = rdma_getaddrinfo("192.168.97.111", "17174", &hints, &rai);
+  ret = rdma_getaddrinfo("192.168.97.111", "10086", &hints, &rai);
   if (ret) {
     fprintf(stderr, "rdma_getaddrinfo failed\n");
     goto out;
@@ -64,12 +66,11 @@ int main(int argc, char **argv) {
 
   struct rdma_cm_event *event;
   while (!ret && !ctx->connected) {
-    printf("waiting for event\n");
     ret = rdma_get_cm_event(ctx->ec, &event);
     if (!ret) {
       switch (event->event) {
       case RDMA_CM_EVENT_ADDR_RESOLVED:
-        printf("ADDR_RESOLVED\n");
+        printf("address resolved\n");
         ret = rdma_resolve_route(ctx->cma_id, 2000);
         if (ret) {
           fprintf(stderr, "rdma_resolve_route failed\n");
@@ -77,7 +78,7 @@ int main(int argc, char **argv) {
         }
         break;
       case RDMA_CM_EVENT_ROUTE_RESOLVED:
-        printf("ROUTE_RESOLVED\n");
+        printf("route resolved\n");
         struct rdma_conn_param conn_param = {};
         ctx->pd = ibv_alloc_pd(ctx->cma_id->verbs);
         if (!ctx->pd) {
@@ -108,14 +109,14 @@ int main(int argc, char **argv) {
           goto out;
         }
 
-        ctx->send_region = malloc(1024);
+        ctx->send_region = malloc(BUFFER_SIZE);
         if (!ctx->send_region) {
           fprintf(stderr, "malloc failed\n");
           goto out;
         }
 
-        ctx->send_mr =
-            ibv_reg_mr(ctx->pd, ctx->send_region, 1024, IBV_ACCESS_LOCAL_WRITE);
+        ctx->send_mr = ibv_reg_mr(ctx->pd, ctx->send_region, BUFFER_SIZE,
+                                  IBV_ACCESS_LOCAL_WRITE);
         if (!ctx->send_mr) {
           fprintf(stderr, "ibv_reg_mr failed\n");
           goto out;
@@ -130,9 +131,8 @@ int main(int argc, char **argv) {
           goto out;
         }
         break;
-
       case RDMA_CM_EVENT_ESTABLISHED:
-        printf("RDMA_CM_EVENT_ESTABLISHED\n");
+        printf("rdma connection established\n");
         ctx->remote_qpn = event->param.ud.qp_num;
         ctx->remote_qkey = event->param.ud.qkey;
         ctx->ah = ibv_create_ah(ctx->pd, &event->param.ud.ah_attr);
@@ -159,14 +159,14 @@ int main(int argc, char **argv) {
   }
 
   /* write something to send region, use safe api */
-  memset(ctx->send_region, 0, 1024);
-  strncpy((char *)ctx->send_region, "Hello from client", 1024);
+  memset(ctx->send_region, 0, BUFFER_SIZE);
+  strncpy((char *)ctx->send_region, "Hello from client", BUFFER_SIZE);
   if (!ctx->connected)
     return 0;
   printf("Post send\n");
-  ret =
-      rdma_post_ud_send(ctx->cma_id, ctx, ctx->send_region, 1024, ctx->send_mr,
-                        IBV_SEND_SIGNALED, ctx->ah, ctx->remote_qpn);
+  ret = rdma_post_ud_send(ctx->cma_id, ctx, ctx->send_region, BUFFER_SIZE,
+                          ctx->send_mr, IBV_SEND_SIGNALED, ctx->ah,
+                          ctx->remote_qpn);
   if (ret) {
     fprintf(stderr, "rdma_post_send failed\n");
     goto out;

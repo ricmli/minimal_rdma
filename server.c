@@ -1,8 +1,9 @@
 #include <rdma/rdma_cma.h>
 #include <rdma/rdma_verbs.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+const int BUFFER_SIZE = 100;
 
 struct ctx {
   struct rdma_event_channel *ec;
@@ -37,7 +38,7 @@ int main(int argc, char **argv) {
   hints.ai_port_space = RDMA_PS_UDP;
   hints.ai_flags = RAI_PASSIVE;
   struct rdma_addrinfo *rai;
-  ret = rdma_getaddrinfo("192.168.97.111", "17174", &hints, &rai);
+  ret = rdma_getaddrinfo("192.168.97.111", "10086", &hints, &rai);
   if (ret) {
     fprintf(stderr, "rdma_getaddrinfo failed\n");
     goto out;
@@ -57,13 +58,11 @@ int main(int argc, char **argv) {
 
   struct rdma_cm_event *event;
   while (!ret) {
-    printf("waiting for event\n");
     ret = rdma_get_cm_event(ctx->ec, &event);
     if (!ret) {
       // handle connect
       if (event->event == RDMA_CM_EVENT_CONNECT_REQUEST) {
         printf("got connect request\n");
-
         // init queues
         ctx->pd = ibv_alloc_pd(event->id->verbs);
         if (!ctx->pd) {
@@ -95,22 +94,23 @@ int main(int argc, char **argv) {
         }
         ctx->qp = event->id->qp;
 
-        ctx->recv_region = malloc(1024 + sizeof(struct ibv_grh));
+        ctx->recv_region = malloc(BUFFER_SIZE + sizeof(struct ibv_grh));
         if (!ctx->recv_region) {
           fprintf(stderr, "malloc failed\n");
           goto out;
         }
 
-        ctx->recv_mr =
-            ibv_reg_mr(ctx->pd, ctx->recv_region, 1024 + sizeof(struct ibv_grh),
-                       IBV_ACCESS_LOCAL_WRITE);
+        ctx->recv_mr = ibv_reg_mr(ctx->pd, ctx->recv_region,
+                                  BUFFER_SIZE + sizeof(struct ibv_grh),
+                                  IBV_ACCESS_LOCAL_WRITE);
         if (!ctx->recv_mr) {
           fprintf(stderr, "ibv_reg_mr failed\n");
           goto out;
         }
 
-        ret = rdma_post_recv(event->id, ctx, ctx->recv_region,
-                             1024 + sizeof(struct ibv_grh), ctx->recv_mr);
+        ret =
+            rdma_post_recv(event->id, ctx, ctx->recv_region,
+                           BUFFER_SIZE + sizeof(struct ibv_grh), ctx->recv_mr);
         if (ret) {
           fprintf(stderr, "rdma_post_recv failed\n");
           goto out;
@@ -154,7 +154,7 @@ int main(int argc, char **argv) {
   }
 
 out:
-
+  rdma_ack_cm_event(event);
   if (ctx->recv_mr)
     ibv_dereg_mr(ctx->recv_mr);
   if (ctx->recv_region)

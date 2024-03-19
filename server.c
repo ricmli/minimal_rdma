@@ -3,7 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-const int BUFFER_SIZE = 100;
+const int BUFFER_SIZE = 2048 * 2048;
+const int MSG_SIZE = 128;
 
 struct ctx {
   struct rdma_event_channel *ec;
@@ -78,8 +79,8 @@ int main(int argc, char **argv) {
         }
 
         struct ibv_qp_init_attr init_qp_attr = {};
-        init_qp_attr.cap.max_send_wr = 1;
-        init_qp_attr.cap.max_recv_wr = 1;
+        init_qp_attr.cap.max_send_wr = 3;
+        init_qp_attr.cap.max_recv_wr = 3;
         init_qp_attr.cap.max_send_sge = 1;
         init_qp_attr.cap.max_recv_sge = 1;
         init_qp_attr.qp_context = ctx;
@@ -108,9 +109,24 @@ int main(int argc, char **argv) {
           goto out;
         }
 
+        ret = rdma_post_recv(event->id, ctx, ctx->recv_region,
+                             MSG_SIZE + sizeof(struct ibv_grh), ctx->recv_mr);
+        if (ret) {
+          fprintf(stderr, "rdma_post_recv failed\n");
+          goto out;
+        }
         ret =
-            rdma_post_recv(event->id, ctx, ctx->recv_region,
-                           BUFFER_SIZE + sizeof(struct ibv_grh), ctx->recv_mr);
+            rdma_post_recv(event->id, ctx,
+                           ctx->recv_region + MSG_SIZE + sizeof(struct ibv_grh),
+                           MSG_SIZE + sizeof(struct ibv_grh), ctx->recv_mr);
+        if (ret) {
+          fprintf(stderr, "rdma_post_recv failed\n");
+          goto out;
+        }
+        ret = rdma_post_recv(event->id, ctx,
+                             ctx->recv_region +
+                                 2 * (MSG_SIZE + sizeof(struct ibv_grh)),
+                             MSG_SIZE + sizeof(struct ibv_grh), ctx->recv_mr);
         if (ret) {
           fprintf(stderr, "rdma_post_recv failed\n");
           goto out;
@@ -128,25 +144,32 @@ int main(int argc, char **argv) {
 
         /* poll cq */
         struct ibv_wc wc;
-        do {
-          ret = ibv_poll_cq(ctx->cq, 1, &wc);
-        } while (ret == 0);
-        if (ret < 0) {
-          fprintf(stderr, "ibv_poll_cq failed\n");
-          goto out;
-        }
-        if (wc.status != IBV_WC_SUCCESS) {
-          fprintf(stderr, "Work completion error: %s\n",
-                  ibv_wc_status_str(wc.status));
-          /* check more info */
-          fprintf(stderr, "wc.vendor_error = 0x%x, wc.qp_num = %u\n",
-                  wc.vendor_err, wc.qp_num);
-        }
-        if (wc.opcode == IBV_WC_RECV) {
-          /* read the buffer */
-          char *buf = (char *)ctx->recv_region + sizeof(struct ibv_grh);
-          printf("Received: %s\n", buf);
-          goto out;
+        int recv_count = 0;
+        for (;;) {
+          do {
+            ret = ibv_poll_cq(ctx->cq, 1, &wc);
+          } while (ret == 0);
+          if (ret < 0) {
+            fprintf(stderr, "ibv_poll_cq failed\n");
+            goto out;
+          }
+          if (wc.status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "Work completion error: %s\n",
+                    ibv_wc_status_str(wc.status));
+            /* check more info */
+            fprintf(stderr, "wc.vendor_error = 0x%x, wc.qp_num = %u\n",
+                    wc.vendor_err, wc.qp_num);
+          }
+          if (wc.opcode == IBV_WC_RECV) {
+            /* read the buffer */
+            char *buf = (char *)ctx->recv_region +
+                        recv_count * (MSG_SIZE + sizeof(struct ibv_grh)) +
+                        sizeof(struct ibv_grh);
+            printf("Received: %s\n", buf);
+            recv_count++;
+            if (strncmp(buf, "Bye", 3) == 0)
+              goto out;
+          }
         }
       }
       rdma_ack_cm_event(event);
@@ -169,5 +192,7 @@ out:
     rdma_destroy_id(listen_id);
   if (ctx->ec)
     rdma_destroy_event_channel(ctx->ec);
+
+  free(ctx);
   return ret;
 }

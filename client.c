@@ -3,7 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-const int BUFFER_SIZE = 100;
+const int BUFFER_SIZE = 2048 * 2048;
+const int MSG_SIZE = 128;
 
 struct ctx {
   struct rdma_event_channel *ec;
@@ -94,8 +95,8 @@ int main(int argc, char **argv) {
         }
 
         struct ibv_qp_init_attr init_qp_attr = {};
-        init_qp_attr.cap.max_send_wr = 1;
-        init_qp_attr.cap.max_recv_wr = 1;
+        init_qp_attr.cap.max_send_wr = 3;
+        init_qp_attr.cap.max_recv_wr = 3;
         init_qp_attr.cap.max_send_sge = 1;
         init_qp_attr.cap.max_recv_sge = 1;
         init_qp_attr.qp_context = ctx;
@@ -159,13 +160,32 @@ int main(int argc, char **argv) {
   }
 
   /* write something to send region, use safe api */
-  memset(ctx->send_region, 0, BUFFER_SIZE);
-  strncpy((char *)ctx->send_region, "Hello from client", BUFFER_SIZE);
+  memset(ctx->send_region, 0, MSG_SIZE);
+  strncpy((char *)ctx->send_region, "Hello from client msg 0", MSG_SIZE);
+  strncpy((char *)ctx->send_region + MSG_SIZE, "Hello from client msg 1",
+          MSG_SIZE);
+  strncpy((char *)ctx->send_region + 2 * MSG_SIZE, "Bye", MSG_SIZE);
   if (!ctx->connected)
     return 0;
-  printf("Post send\n");
-  ret = rdma_post_ud_send(ctx->cma_id, ctx, ctx->send_region, BUFFER_SIZE,
+  printf("Post send 0\n");
+  ret = rdma_post_ud_send(ctx->cma_id, ctx, ctx->send_region, MSG_SIZE,
                           ctx->send_mr, IBV_SEND_SIGNALED, ctx->ah,
+                          ctx->remote_qpn);
+  if (ret) {
+    fprintf(stderr, "rdma_post_send failed\n");
+    goto out;
+  }
+  printf("Post send 1\n");
+  ret = rdma_post_ud_send(ctx->cma_id, ctx, ctx->send_region + MSG_SIZE,
+                          MSG_SIZE, ctx->send_mr, IBV_SEND_SIGNALED, ctx->ah,
+                          ctx->remote_qpn);
+  if (ret) {
+    fprintf(stderr, "rdma_post_send failed\n");
+    goto out;
+  }
+  printf("Post send bye\n");
+  ret = rdma_post_ud_send(ctx->cma_id, ctx, ctx->send_region + 2 * MSG_SIZE,
+                          MSG_SIZE, ctx->send_mr, IBV_SEND_SIGNALED, ctx->ah,
                           ctx->remote_qpn);
   if (ret) {
     fprintf(stderr, "rdma_post_send failed\n");
@@ -173,16 +193,23 @@ int main(int argc, char **argv) {
   }
 
   /* poll cq */
-  struct ibv_wc wc;
-  do {
-    ret = ibv_poll_cq(ctx->cq, 1, &wc);
-  } while (ret == 0);
-  if (ret < 0) {
-    fprintf(stderr, "ibv_poll_cq failed\n");
-    goto out;
+  int sent = 0;
+  while (sent < 3) {
+    struct ibv_wc wc[3];
+    do {
+      ret = ibv_poll_cq(ctx->cq, 3, wc);
+    } while (ret == 0);
+    if (ret < 0) {
+      fprintf(stderr, "ibv_poll_cq failed\n");
+      goto out;
+    }
+    for (int i = 0; i < ret; i++) {
+      if (wc[i].opcode == IBV_WC_SEND && wc[i].status == IBV_WC_SUCCESS) {
+        sent++;
+      }
+    }
+    printf("Sent %d\n", sent);
   }
-  if (wc.opcode == IBV_WC_SEND && wc.status == IBV_WC_SUCCESS)
-    printf("Send done\n");
 
 out:
   if (ctx->ah)
@@ -201,5 +228,7 @@ out:
     rdma_destroy_id(ctx->cma_id);
   if (ctx->ec)
     rdma_destroy_event_channel(ctx->ec);
-  return 0;
+
+  free(ctx);
+  return ret;
 }

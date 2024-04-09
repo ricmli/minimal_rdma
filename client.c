@@ -42,7 +42,7 @@ int main(int argc, char **argv) {
   struct rdma_addrinfo *res, *rai;
   hints.ai_port_space = RDMA_PS_UDP;
   hints.ai_flags = RAI_PASSIVE;
-  ret = rdma_getaddrinfo("192.168.97.111", NULL, &hints, &res);
+  ret = rdma_getaddrinfo("192.168.97.2", NULL, &hints, &res);
   if (ret) {
     fprintf(stderr, "rdma_getaddrinfo failed\n");
     goto out;
@@ -51,11 +51,11 @@ int main(int argc, char **argv) {
   hints.ai_src_len = res->ai_src_len;
   hints.ai_flags &= ~RAI_PASSIVE;
   ret = rdma_getaddrinfo("192.168.97.111", "10086", &hints, &rai);
+  rdma_freeaddrinfo(res);
   if (ret) {
     fprintf(stderr, "rdma_getaddrinfo failed\n");
     goto out;
   }
-  rdma_freeaddrinfo(res);
 
   /* connect to server */
   ret =

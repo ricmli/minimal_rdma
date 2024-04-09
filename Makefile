@@ -3,7 +3,7 @@
 CFLAGS  := -Wall -g
 LDLIBS  := ${LDLIBS} -lrdmacm -libverbs
 
-APPS    := server client
+APPS    := server client frame_tx frame_rx
 
 all: ${APPS}
 

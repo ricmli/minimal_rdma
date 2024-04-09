@@ -165,7 +165,7 @@ int main(int argc, char **argv) {
             char *buf = (char *)ctx->recv_region +
                         recv_count * (MSG_SIZE + sizeof(struct ibv_grh)) +
                         sizeof(struct ibv_grh);
-            printf("Received: %s\n", buf);
+            printf("Received: %s, len %u\n", buf, wc.byte_len);
             recv_count++;
             if (strncmp(buf, "Bye", 3) == 0)
               goto out;

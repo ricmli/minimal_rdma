@@ -14,6 +14,7 @@ struct msg {
     struct {
       uint64_t addr;
       uint32_t rkey;
+      uint64_t timestamp;
     } frame;
   } data;
 };

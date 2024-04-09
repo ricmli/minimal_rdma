@@ -1,5 +1,3 @@
-#include <asm-generic/errno.h>
-#include <infiniband/verbs.h>
 #include <rdma/rdma_cma.h>
 #include <rdma/rdma_verbs.h>
 #include <stdint.h>
@@ -203,6 +201,14 @@ int main(int argc, char **argv) {
         /* write the frame */
         struct ibv_send_wr wr = {}, *bad_wr = NULL;
         struct ibv_sge sge;
+
+        struct timespec tp = {};
+        clock_gettime(CLOCK_REALTIME, &tp);
+        uint64_t send_time = tp.tv_sec * 100000000 + tp.tv_nsec;
+        uint64_t request_time = ctx->msg->data.frame.timestamp;
+        ctx->msg->data.frame.timestamp = send_time;
+
+        printf("request elapsed: %lu ns\n", send_time - request_time);
 
         wr.wr_id = ctx->msg->data.frame.addr;
         wr.opcode = IBV_WR_RDMA_WRITE;

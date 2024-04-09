@@ -1,6 +1,4 @@
 #include "frame_common.h"
-#include <asm-generic/errno.h>
-#include <infiniband/verbs.h>
 #include <rdma/rdma_cma.h>
 #include <rdma/rdma_verbs.h>
 #include <stdint.h>
@@ -48,10 +46,13 @@ static int post_frame_recv(struct ctx *ctx) {
   if (!f) {
     return -1;
   }
+  struct timespec tp = {};
+  clock_gettime(CLOCK_REALTIME, &tp);
   /* post send frame_ready to tx */
   ctx->msg->id = MSG_RX_FRAME_READY;
   ctx->msg->data.frame.addr = (uint64_t)f->addr;
   ctx->msg->data.frame.rkey = ctx->frame_mr->rkey;
+  ctx->msg->data.frame.timestamp = tp.tv_sec * 100000000 + tp.tv_nsec;
   rdma_post_send(ctx->cma_id, f, ctx->msg, sizeof(*ctx->msg), ctx->msg_mr, 0);
 
   /* post recv frame_done from tx */
@@ -215,12 +216,17 @@ int main(int argc, char **argv) {
             /* check msg */
             if (ctx->msg->id == MSG_TX_FRAME_DONE) {
               /* done */
+              struct timespec tp = {};
+              clock_gettime(CLOCK_REALTIME, &tp);
+              uint64_t now = tp.tv_sec * 100000000 + tp.tv_nsec;
+              uint64_t send_time = ctx->msg->data.frame.timestamp;
               struct frame *f = (struct frame *)wc.wr_id;
               f->status = FRAME_DONE_WRITING;
               ctx->recv_count++;
-              printf("reved %d\n", ctx->recv_count);
+              printf("reved %d, latency %lu ns\n", ctx->recv_count,
+                     now - send_time);
               /* pretend to use it */
-              sleep(1);
+              usleep(20000);
               f->status = FRAME_FREE;
               post_frame_recv(ctx);
             }

@@ -1,8 +1,10 @@
+#include <infiniband/verbs.h>
 #include <rdma/rdma_cma.h>
 #include <rdma/rdma_verbs.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 
 #include "frame_common.h"
 
@@ -31,13 +33,18 @@ struct ctx {
   struct ibv_mr *msg_mr;
   struct msg *msg;
   char *frame_region;
+  size_t region_size;
   int connected;
+
+  int num_frames;
 };
 
 int main(int argc, char **argv) {
+  Args parsed_args = parse_args(argc, argv);
   int ret = 0;
   int sent = 0;
   struct ctx *ctx = calloc(1, sizeof *ctx);
+  ctx->num_frames = parsed_args.number_of_frames;
   ctx->ec = rdma_create_event_channel();
   if (!ctx->ec) {
     fprintf(stderr, "rdma_create_event_channel failed\n");
@@ -54,7 +61,7 @@ int main(int argc, char **argv) {
   struct rdma_addrinfo *res, *rai;
   hints.ai_port_space = RDMA_PS_TCP;
   hints.ai_flags = RAI_PASSIVE;
-  ret = rdma_getaddrinfo("192.168.97.2", NULL, &hints, &res);
+  ret = rdma_getaddrinfo(parsed_args.local_ip_address, NULL, &hints, &res);
   if (ret) {
     fprintf(stderr, "rdma_getaddrinfo failed\n");
     goto out;
@@ -62,7 +69,8 @@ int main(int argc, char **argv) {
   hints.ai_src_addr = res->ai_src_addr;
   hints.ai_src_len = res->ai_src_len;
   hints.ai_flags &= ~RAI_PASSIVE;
-  ret = rdma_getaddrinfo("192.168.97.111", "20086", &hints, &rai);
+  ret = rdma_getaddrinfo(parsed_args.remote_ip_address, parsed_args.port_number,
+                         &hints, &rai);
   rdma_freeaddrinfo(res);
   if (ret) {
     fprintf(stderr, "rdma_getaddrinfo failed\n");
@@ -121,14 +129,19 @@ int main(int argc, char **argv) {
         }
         ctx->qp = event->id->qp;
 
-        ctx->frame_region = malloc(FRAME_BUFFER_SIZE);
+        ctx->region_size = parsed_args.frame_width * parsed_args.frame_height *
+                           (parsed_args.bit_depth == 8 ? 2 : 4);
+
+        ctx->frame_region =
+            mmap(NULL, ctx->region_size, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
         if (!ctx->frame_region) {
-          fprintf(stderr, "malloc failed\n");
+          fprintf(stderr, "mmap failed\n");
           goto out;
         }
 
         ctx->frame_mr =
-            ibv_reg_mr(ctx->pd, ctx->frame_region, FRAME_BUFFER_SIZE, 0);
+            ibv_reg_mr(ctx->pd, ctx->frame_region, ctx->region_size, 0);
         if (!ctx->frame_mr) {
           fprintf(stderr, "ibv_reg_mr failed\n");
           goto out;
@@ -206,7 +219,7 @@ int main(int argc, char **argv) {
         clock_gettime(CLOCK_REALTIME, &tp);
         uint64_t send_time = tp.tv_sec * 100000000 + tp.tv_nsec;
         uint64_t request_time = ctx->msg->data.frame.timestamp;
-        ctx->msg->data.frame.timestamp = send_time;
+        // ctx->msg->data.frame.timestamp = send_time; /* keep rx timestamp */
 
         printf("request elapsed: %lu ns\n", send_time - request_time);
 
@@ -218,7 +231,7 @@ int main(int argc, char **argv) {
         wr.wr.rdma.remote_addr = ctx->msg->data.frame.addr;
         wr.wr.rdma.rkey = ctx->msg->data.frame.rkey;
         sge.addr = (uintptr_t)ctx->frame_region;
-        sge.length = FRAME_BUFFER_SIZE;
+        sge.length = ctx->region_size;
         sge.lkey = ctx->frame_mr->lkey;
         ibv_post_send(ctx->qp, &wr, &bad_wr);
       }
@@ -231,6 +244,8 @@ int main(int argc, char **argv) {
                      ctx->msg_mr, 0);
       sent++;
       printf("sent %d\n", sent);
+      if (sent >= ctx->num_frames)
+        goto out;
       /* send done, wait next ready in advance */
       rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg),
                      ctx->msg_mr);
@@ -248,9 +263,11 @@ out:
   if (ctx->frame_mr)
     ibv_dereg_mr(ctx->frame_mr);
   if (ctx->frame_region)
-    free(ctx->frame_region);
+    munmap(ctx->frame_region, ctx->region_size);
   if (ctx->cma_id && ctx->cma_id->qp)
     rdma_destroy_qp(ctx->cma_id);
+  if (ctx->cq)
+    ibv_destroy_cq(ctx->cq);
   if (ctx->pd)
     ibv_dealloc_pd(ctx->pd);
   if (rai)

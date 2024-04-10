@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 enum frame_status {
@@ -31,9 +32,12 @@ struct ctx {
   struct ibv_mr *msg_mr;
   struct msg *msg;
   char *frame_region;
+  size_t region_size;
 
   struct frame frames[2];
   int recv_count;
+
+  int num_frames;
 };
 
 static int post_frame_recv(struct ctx *ctx) {
@@ -62,8 +66,10 @@ static int post_frame_recv(struct ctx *ctx) {
 }
 
 int main(int argc, char **argv) {
+  Args parsed_args = parse_args(argc, argv);
   int ret = 0;
   struct ctx *ctx = calloc(1, sizeof *ctx);
+  ctx->num_frames = parsed_args.number_of_frames;
   ctx->ec = rdma_create_event_channel();
   if (!ctx->ec) {
     fprintf(stderr, "rdma_create_event_channel failed\n");
@@ -81,7 +87,8 @@ int main(int argc, char **argv) {
   hints.ai_port_space = RDMA_PS_TCP;
   hints.ai_flags = RAI_PASSIVE;
   struct rdma_addrinfo *rai;
-  ret = rdma_getaddrinfo("192.168.97.111", "20086", &hints, &rai);
+  ret = rdma_getaddrinfo(parsed_args.local_ip_address, parsed_args.port_number,
+                         &hints, &rai);
   if (ret) {
     fprintf(stderr, "rdma_getaddrinfo failed\n");
     goto out;
@@ -137,25 +144,30 @@ int main(int argc, char **argv) {
         }
         ctx->qp = event->id->qp;
 
-        size_t region_size = FRAME_BUFFER_CNT * FRAME_BUFFER_SIZE;
-        ctx->frame_region = malloc(region_size);
+        size_t frame_size = parsed_args.frame_width * parsed_args.frame_height *
+                            (parsed_args.bit_depth == 8 ? 2 : 4);
+
+        ctx->region_size = FRAME_BUFFER_CNT * frame_size;
+        ctx->frame_region =
+            mmap(NULL, ctx->region_size, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
         if (!ctx->frame_region) {
-          fprintf(stderr, "malloc failed\n");
+          fprintf(stderr, "mmap failed\n");
           goto out;
         }
 
         for (int i = 0; i < FRAME_BUFFER_CNT; i++) {
           struct frame f = {
               .idx = i,
-              .addr = ctx->frame_region + i * FRAME_BUFFER_SIZE,
-              .size = FRAME_BUFFER_SIZE,
+              .addr = ctx->frame_region + i * frame_size,
+              .size = frame_size,
               .status = FRAME_FREE,
           };
           ctx->frames[i] = f;
         }
 
         ctx->frame_mr =
-            ibv_reg_mr(ctx->pd, ctx->frame_region, region_size,
+            ibv_reg_mr(ctx->pd, ctx->frame_region, ctx->region_size,
                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
         if (!ctx->frame_mr) {
           fprintf(stderr, "ibv_reg_mr failed\n");
@@ -223,11 +235,13 @@ int main(int argc, char **argv) {
               struct frame *f = (struct frame *)wc.wr_id;
               f->status = FRAME_DONE_WRITING;
               ctx->recv_count++;
-              printf("reved %d, latency %lu ns\n", ctx->recv_count,
+              printf("reved %d, round latency %lu ns\n", ctx->recv_count,
                      now - send_time);
               /* pretend to use it */
-              usleep(20000);
+              usleep(200000);
               f->status = FRAME_FREE;
+              if (ctx->recv_count == ctx->num_frames)
+                goto out;
               post_frame_recv(ctx);
             }
           }
@@ -238,8 +252,6 @@ int main(int argc, char **argv) {
   }
 
 out:
-  printf("revd %d\n", ctx->recv_count);
-
   rdma_ack_cm_event(event);
   if (ctx->msg_mr)
     ibv_dereg_mr(ctx->msg_mr);
@@ -248,9 +260,11 @@ out:
   if (ctx->frame_mr)
     ibv_dereg_mr(ctx->frame_mr);
   if (ctx->frame_region)
-    free(ctx->frame_region);
+    munmap(ctx->frame_region, ctx->region_size);
   if (ctx->qp)
     ibv_destroy_qp(ctx->qp);
+  if (ctx->cq)
+    ibv_destroy_cq(ctx->cq);
   if (ctx->pd)
     ibv_dealloc_pd(ctx->pd);
   if (rai)

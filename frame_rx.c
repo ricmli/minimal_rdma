@@ -38,6 +38,11 @@ struct ctx {
   int recv_count;
 
   int num_frames;
+
+  uint64_t round_latency_min;
+  uint64_t round_latency_max;
+  uint64_t round_latency_sum;
+  uint64_t round_latency_cnt;
 };
 
 static int post_frame_recv(struct ctx *ctx) {
@@ -56,7 +61,7 @@ static int post_frame_recv(struct ctx *ctx) {
   ctx->msg->id = MSG_RX_FRAME_READY;
   ctx->msg->data.frame.addr = (uint64_t)f->addr;
   ctx->msg->data.frame.rkey = ctx->frame_mr->rkey;
-  ctx->msg->data.frame.timestamp = tp.tv_sec * 100000000 + tp.tv_nsec;
+  ctx->msg->data.frame.timestamp = tp.tv_sec * 1e9 + tp.tv_nsec;
   rdma_post_send(ctx->cma_id, f, ctx->msg, sizeof(*ctx->msg), ctx->msg_mr, 0);
 
   /* post recv frame_done from tx */
@@ -70,6 +75,11 @@ int main(int argc, char **argv) {
   int ret = 0;
   struct ctx *ctx = calloc(1, sizeof *ctx);
   ctx->num_frames = parsed_args.number_of_frames;
+  ctx->round_latency_min = UINT64_MAX;
+  ctx->round_latency_max = 0;
+  ctx->round_latency_sum = 0;
+  ctx->round_latency_cnt = 0;
+
   ctx->ec = rdma_create_event_channel();
   if (!ctx->ec) {
     fprintf(stderr, "rdma_create_event_channel failed\n");
@@ -230,13 +240,25 @@ int main(int argc, char **argv) {
               /* done */
               struct timespec tp = {};
               clock_gettime(CLOCK_REALTIME, &tp);
-              uint64_t now = tp.tv_sec * 100000000 + tp.tv_nsec;
-              uint64_t send_time = ctx->msg->data.frame.timestamp;
+              uint64_t now = tp.tv_sec * 1e9 + tp.tv_nsec;
+              uint64_t request_time = ctx->msg->data.frame.timestamp;
+              uint64_t round_latency = now - request_time;
+              if (ctx->recv_count > 0 && round_latency < 1e9 /* 1s */) {
+                ctx->round_latency_min = round_latency < ctx->round_latency_min
+                                             ? round_latency
+                                             : ctx->round_latency_min;
+                ctx->round_latency_max = round_latency > ctx->round_latency_max
+                                             ? round_latency
+                                             : ctx->round_latency_max;
+                ctx->round_latency_sum += round_latency;
+                ctx->round_latency_cnt++;
+                printf("frame %d, round latency %lu ns\n", ctx->recv_count,
+                       round_latency);
+              }
               struct frame *f = (struct frame *)wc.wr_id;
               f->status = FRAME_DONE_WRITING;
               ctx->recv_count++;
-              printf("reved %d, round latency %lu ns\n", ctx->recv_count,
-                     now - send_time);
+
               /* pretend to use it */
               usleep(200000);
               f->status = FRAME_FREE;
@@ -252,6 +274,11 @@ int main(int argc, char **argv) {
   }
 
 out:
+  /* print statistics */
+  printf("round_latency: avg %lu, min %lu, max %lu\n",
+         ctx->round_latency_sum / ctx->round_latency_cnt,
+         ctx->round_latency_min, ctx->round_latency_max);
+
   rdma_ack_cm_event(event);
   if (ctx->msg_mr)
     ibv_dereg_mr(ctx->msg_mr);

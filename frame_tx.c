@@ -37,6 +37,11 @@ struct ctx {
   int connected;
 
   int num_frames;
+
+  uint64_t request_elapsed_min;
+  uint64_t request_elapsed_max;
+  uint64_t request_elapsed_sum;
+  uint64_t request_elapsed_cnt;
 };
 
 int main(int argc, char **argv) {
@@ -45,6 +50,11 @@ int main(int argc, char **argv) {
   int sent = 0;
   struct ctx *ctx = calloc(1, sizeof *ctx);
   ctx->num_frames = parsed_args.number_of_frames;
+  ctx->request_elapsed_min = UINT64_MAX;
+  ctx->request_elapsed_max = 0;
+  ctx->request_elapsed_sum = 0;
+  ctx->request_elapsed_cnt = 0;
+
   ctx->ec = rdma_create_event_channel();
   if (!ctx->ec) {
     fprintf(stderr, "rdma_create_event_channel failed\n");
@@ -217,11 +227,21 @@ int main(int argc, char **argv) {
 
         struct timespec tp = {};
         clock_gettime(CLOCK_REALTIME, &tp);
-        uint64_t send_time = tp.tv_sec * 100000000 + tp.tv_nsec;
+        uint64_t send_time = tp.tv_sec * 1e9 + tp.tv_nsec;
         uint64_t request_time = ctx->msg->data.frame.timestamp;
-        // ctx->msg->data.frame.timestamp = send_time; /* keep rx timestamp */
+        uint64_t request_elapsed = send_time - request_time;
 
-        printf("request elapsed: %lu ns\n", send_time - request_time);
+        if (sent > 1 && request_elapsed < 1e6 /* 10 ms */) {
+          ctx->request_elapsed_min = request_elapsed < ctx->request_elapsed_min
+                                         ? request_elapsed
+                                         : ctx->request_elapsed_min;
+          ctx->request_elapsed_max = request_elapsed > ctx->request_elapsed_max
+                                         ? request_elapsed
+                                         : ctx->request_elapsed_max;
+          ctx->request_elapsed_sum += request_elapsed;
+          ctx->request_elapsed_cnt++;
+          printf("request elapsed: %lu ns\n", request_elapsed);
+        }
 
         wr.wr_id = ctx->msg->data.frame.addr;
         wr.opcode = IBV_WR_RDMA_WRITE;
@@ -256,6 +276,11 @@ int main(int argc, char **argv) {
   }
 
 out:
+  /* print statistics */
+  printf("request latency: avg %lu, min %lu, max %lu\n",
+         ctx->request_elapsed_sum / ctx->request_elapsed_cnt,
+         ctx->request_elapsed_min, ctx->request_elapsed_max);
+
   if (ctx->msg_mr)
     ibv_dereg_mr(ctx->msg_mr);
   if (ctx->msg)

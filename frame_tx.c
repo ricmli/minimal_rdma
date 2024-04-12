@@ -1,4 +1,3 @@
-#include <infiniband/verbs.h>
 #include <rdma/rdma_cma.h>
 #include <rdma/rdma_verbs.h>
 #include <stdint.h>
@@ -258,10 +257,12 @@ int main(int argc, char **argv) {
     }
     if (wc.opcode == IBV_WC_RDMA_WRITE) {
       /* write done, send done msg */
-      ctx->msg->id = MSG_TX_FRAME_DONE;
-      ctx->msg->data.frame.addr = wc.wr_id;
-      rdma_post_send(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg),
-                     ctx->msg_mr, 0);
+      struct msg td_msg = {};
+      td_msg.id = MSG_TX_FRAME_DONE;
+      td_msg.data.frame.addr = wc.wr_id;
+      td_msg.data.frame.timestamp = ctx->msg->data.frame.timestamp;
+      rdma_post_send(ctx->cma_id, NULL, &td_msg, sizeof(td_msg), NULL,
+                     IBV_SEND_INLINE);
       sent++;
       printf("sent %d\n", sent);
       if (sent >= ctx->num_frames)
@@ -269,9 +270,6 @@ int main(int argc, char **argv) {
       /* send done, wait next ready in advance */
       rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg),
                      ctx->msg_mr);
-    }
-    if (wc.opcode == IBV_WC_SEND) {
-      /* send done succ */
     }
   }
 

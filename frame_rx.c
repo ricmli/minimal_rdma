@@ -1,4 +1,4 @@
-#include "frame_common.h"
+
 #include <rdma/rdma_cma.h>
 #include <rdma/rdma_verbs.h>
 #include <stdint.h>
@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#include "frame_common.h"
 
 enum frame_status {
   FRAME_FREE = 0,
@@ -57,12 +59,14 @@ static int post_frame_recv(struct ctx *ctx) {
   }
   struct timespec tp = {};
   clock_gettime(CLOCK_REALTIME, &tp);
-  /* post send frame_ready to tx */
-  ctx->msg->id = MSG_RX_FRAME_READY;
-  ctx->msg->data.frame.addr = (uint64_t)f->addr;
-  ctx->msg->data.frame.rkey = ctx->frame_mr->rkey;
-  ctx->msg->data.frame.timestamp = tp.tv_sec * 1e9 + tp.tv_nsec;
-  rdma_post_send(ctx->cma_id, f, ctx->msg, sizeof(*ctx->msg), ctx->msg_mr, 0);
+  /* send frame_ready to tx */
+  struct msg rd_msg = {};
+  rd_msg.id = MSG_RX_FRAME_READY;
+  rd_msg.data.frame.addr = (uint64_t)f->addr;
+  rd_msg.data.frame.rkey = ctx->frame_mr->rkey;
+  rd_msg.data.frame.timestamp = tp.tv_sec * 1e9 + tp.tv_nsec;
+  rdma_post_send(ctx->cma_id, f, &rd_msg, sizeof(rd_msg), NULL,
+                 IBV_SEND_INLINE);
 
   /* post recv frame_done from tx */
   rdma_post_recv(ctx->cma_id, f, ctx->msg, sizeof(*ctx->msg), ctx->msg_mr);
@@ -228,11 +232,6 @@ int main(int argc, char **argv) {
             /* check more info */
             fprintf(stderr, "wc.vendor_error = 0x%x, wc.qp_num = %u\n",
                     wc.vendor_err, wc.qp_num);
-          }
-          if (wc.opcode == IBV_WC_SEND) {
-            /* send ready succ */
-            struct frame *f = (struct frame *)wc.wr_id;
-            f->status = FRAME_IN_WRITING;
           }
           if (wc.opcode == IBV_WC_RECV) {
             /* check msg */

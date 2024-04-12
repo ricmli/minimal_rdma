@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
 const int FRAME_BUFFER_CNT = 2;
 
 enum msg_id { MSG_NONE = 0, MSG_RX_FRAME_READY, MSG_TX_FRAME_DONE };

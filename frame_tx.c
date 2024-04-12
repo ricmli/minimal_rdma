@@ -109,7 +109,7 @@ int main(int argc, char **argv) {
         break;
       case RDMA_CM_EVENT_ROUTE_RESOLVED:
         printf("route resolved\n");
-        struct rdma_conn_param conn_param = {};
+
         ctx->pd = ibv_alloc_pd(event->id->verbs);
         if (!ctx->pd) {
           ret = -ENOMEM;
@@ -123,15 +123,16 @@ int main(int argc, char **argv) {
           goto out;
         }
 
-        struct ibv_qp_init_attr init_qp_attr = {};
-        init_qp_attr.cap.max_send_wr = 10;
-        init_qp_attr.cap.max_recv_wr = 10;
-        init_qp_attr.cap.max_send_sge = 1;
-        init_qp_attr.cap.max_recv_sge = 1;
-        init_qp_attr.cap.max_inline_data = sizeof(struct msg);
-        init_qp_attr.send_cq = ctx->cq;
-        init_qp_attr.recv_cq = ctx->cq;
-        init_qp_attr.qp_type = IBV_QPT_RC;
+        struct ibv_qp_init_attr init_qp_attr = {
+            .cap.max_send_wr = 10,
+            .cap.max_recv_wr = 10,
+            .cap.max_send_sge = 1,
+            .cap.max_recv_sge = 1,
+            .cap.max_inline_data = sizeof(struct msg),
+            .send_cq = ctx->cq,
+            .recv_cq = ctx->cq,
+            .qp_type = IBV_QPT_RC,
+        };
         ret = rdma_create_qp(event->id, ctx->pd, &init_qp_attr);
         if (ret) {
           fprintf(stderr, "ibv_create_qp failed\n");
@@ -170,8 +171,11 @@ int main(int argc, char **argv) {
           goto out;
         }
 
-        conn_param.initiator_depth = conn_param.responder_resources = 1;
-        conn_param.rnr_retry_count = 7; /* infinite retry */
+        struct rdma_conn_param conn_param = {
+            .initiator_depth = 1,
+            .responder_resources = 1,
+            .rnr_retry_count = 7 /* infinite retry */,
+        };
         printf("connecting\n");
         ret = rdma_connect(event->id, &conn_param);
         if (ret) {
@@ -181,6 +185,7 @@ int main(int argc, char **argv) {
         break;
       case RDMA_CM_EVENT_ESTABLISHED:
         ctx->connected = 1;
+        printf("connected\n");
         break;
       case RDMA_CM_EVENT_ADDR_ERROR:
       case RDMA_CM_EVENT_ROUTE_ERROR:
@@ -198,8 +203,14 @@ int main(int argc, char **argv) {
     }
   }
 
-  /* wait for a rtt message */
+  /* wait for a message */
   rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg), ctx->msg_mr);
+
+  struct msg rtt_msg = {
+      .id = MSG_TX_MEASURE_RTT_START,
+  };
+  rdma_post_send(ctx->cma_id, NULL, &rtt_msg, sizeof(rtt_msg), NULL,
+                 IBV_SEND_INLINE);
 
   /* poll cq */
   struct ibv_wc wc;
@@ -221,42 +232,41 @@ int main(int argc, char **argv) {
     if (wc.opcode == IBV_WC_RECV) {
       if (ctx->msg->id == MSG_RX_MEASURE_RTT) {
         struct msg rtt_msg = {
-            .id = MSG_TX_MEASURE_RTT,
+            .id = MSG_TX_MEASURE_RTT_DONE,
             .data.measure_rtt.timestamp = ctx->msg->data.measure_rtt.timestamp,
         };
         rdma_post_send(ctx->cma_id, NULL, &rtt_msg, sizeof(rtt_msg), NULL,
                        IBV_SEND_INLINE);
-        /* wait for a ready message */
-        rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg),
-                       ctx->msg_mr);
-      }
-      if (ctx->msg->id == MSG_RX_FRAME_READY) {
+        printf("Start sending:\n");
+      } else if (ctx->msg->id == MSG_RX_FRAME_READY) {
         /* write the frame */
         rdma_post_write(ctx->cma_id, (void *)ctx->msg->data.frame.addr,
                         ctx->frame_region, ctx->region_size, ctx->frame_mr,
                         IBV_SEND_SIGNALED, ctx->msg->data.frame.addr,
                         ctx->msg->data.frame.rkey);
       }
-    }
-    if (wc.opcode == IBV_WC_RDMA_WRITE) {
+      /* wait for next message */
+      rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg),
+                     ctx->msg_mr);
+    } else if (wc.opcode == IBV_WC_RDMA_WRITE) {
       /* write done, send done msg */
-      struct msg td_msg = {};
-      td_msg.id = MSG_TX_FRAME_DONE;
-      td_msg.data.frame.addr = wc.wr_id;
-      td_msg.data.frame.timestamp = ctx->msg->data.frame.timestamp;
+      struct msg td_msg = {
+          .id = MSG_TX_FRAME_DONE,
+          .data.frame.addr = wc.wr_id,
+          .data.frame.timestamp = ctx->msg->data.frame.timestamp,
+      };
       rdma_post_send(ctx->cma_id, NULL, &td_msg, sizeof(td_msg), NULL,
                      IBV_SEND_INLINE);
       sent++;
-      printf("sent %d\n", sent);
+      printf(".");
+      fflush(stdout);
       if (sent >= ctx->num_frames)
         goto out;
-      /* send done, wait next ready in advance */
-      rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg),
-                     ctx->msg_mr);
     }
   }
 
 out:
+  printf("\nsent %d\n", sent);
   if (ctx->msg_mr)
     ibv_dereg_mr(ctx->msg_mr);
   if (ctx->msg)

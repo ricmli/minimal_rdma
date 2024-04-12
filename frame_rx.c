@@ -58,16 +58,17 @@ static int post_frame_recv(struct ctx *ctx) {
     return -1;
   }
   struct timespec tp = {};
-  clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
+  clock_gettime(CLOCK_MONOTONIC, &tp);
+  uint64_t now = tp.tv_sec * 1e9 + tp.tv_nsec;
   /* send frame_ready to tx */
-  struct msg rd_msg = {};
-  rd_msg.id = MSG_RX_FRAME_READY;
-  rd_msg.data.frame.addr = (uint64_t)f->addr;
-  rd_msg.data.frame.rkey = ctx->frame_mr->rkey;
-  rd_msg.data.frame.timestamp = tp.tv_sec * 1e9 + tp.tv_nsec;
+  struct msg rd_msg = {
+      .id = MSG_RX_FRAME_READY,
+      .data.frame.addr = (uint64_t)f->addr,
+      .data.frame.rkey = ctx->frame_mr->rkey,
+      .data.frame.timestamp = now,
+  };
   rdma_post_send(ctx->cma_id, f, &rd_msg, sizeof(rd_msg), NULL,
                  IBV_SEND_INLINE);
-
   /* post recv frame_done from tx */
   rdma_post_recv(ctx->cma_id, f, ctx->msg, sizeof(*ctx->msg), ctx->msg_mr);
   printf("rev next frame %d\n", ctx->recv_count);
@@ -77,6 +78,7 @@ static int post_frame_recv(struct ctx *ctx) {
 int main(int argc, char **argv) {
   Args parsed_args = parse_args(argc, argv);
   int ret = 0;
+  uint64_t rtt = 0;
   struct ctx *ctx = calloc(1, sizeof *ctx);
   ctx->num_frames = parsed_args.number_of_frames;
   ctx->round_latency_min = UINT64_MAX;
@@ -97,9 +99,8 @@ int main(int argc, char **argv) {
     goto out;
   }
 
-  struct rdma_addrinfo hints = {};
-  hints.ai_port_space = RDMA_PS_TCP;
-  hints.ai_flags = RAI_PASSIVE;
+  struct rdma_addrinfo hints = {.ai_port_space = RDMA_PS_TCP,
+                                .ai_flags = RAI_PASSIVE};
   struct rdma_addrinfo *rai;
   ret = rdma_getaddrinfo(parsed_args.local_ip_address, parsed_args.port_number,
                          &hints, &rai);
@@ -143,15 +144,16 @@ int main(int argc, char **argv) {
           goto out;
         }
 
-        struct ibv_qp_init_attr init_qp_attr = {};
-        init_qp_attr.cap.max_send_wr = 10;
-        init_qp_attr.cap.max_recv_wr = 10;
-        init_qp_attr.cap.max_send_sge = 1;
-        init_qp_attr.cap.max_recv_sge = 1;
-        init_qp_attr.cap.max_inline_data = sizeof(struct msg);
-        init_qp_attr.send_cq = ctx->cq;
-        init_qp_attr.recv_cq = ctx->cq;
-        init_qp_attr.qp_type = IBV_QPT_RC;
+        struct ibv_qp_init_attr init_qp_attr = {
+            .cap.max_send_wr = 10,
+            .cap.max_recv_wr = 10,
+            .cap.max_send_sge = 1,
+            .cap.max_recv_sge = 1,
+            .cap.max_inline_data = sizeof(struct msg),
+            .send_cq = ctx->cq,
+            .recv_cq = ctx->cq,
+            .qp_type = IBV_QPT_RC,
+        };
         ret = rdma_create_qp(event->id, ctx->pd, &init_qp_attr);
         if (ret) {
           fprintf(stderr, "ibv_create_qp failed\n");
@@ -202,9 +204,11 @@ int main(int argc, char **argv) {
           goto out;
         }
 
-        struct rdma_conn_param conn_param = {};
-        conn_param.initiator_depth = conn_param.responder_resources = 1;
-        conn_param.rnr_retry_count = 7; /* infinite retry */
+        struct rdma_conn_param conn_param = {
+            .initiator_depth = 1,
+            .responder_resources = 1,
+            .rnr_retry_count = 7 /* infinite retry */,
+        };
         ret = rdma_accept(event->id, &conn_param);
         if (ret) {
           fprintf(stderr, "rdma_accept failed\n");
@@ -214,14 +218,6 @@ int main(int argc, char **argv) {
 
         printf("Accepted, start receiving...\n");
 
-        /* send measure rtt */
-        struct timespec tp = {};
-        clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
-        struct msg rtt_msg = {};
-        rtt_msg.id = MSG_RX_MEASURE_RTT;
-        rtt_msg.data.measure_rtt.timestamp = tp.tv_sec * 1e9 + tp.tv_nsec;
-        rdma_post_send(ctx->cma_id, NULL, &rtt_msg, sizeof(rtt_msg), NULL,
-                       IBV_SEND_INLINE);
         /* post recv rtt msg from tx */
         rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg),
                        ctx->msg_mr);
@@ -245,24 +241,35 @@ int main(int argc, char **argv) {
                     wc.vendor_err, wc.qp_num);
           }
           if (wc.opcode == IBV_WC_RECV) {
-            if (ctx->msg->id == MSG_TX_MEASURE_RTT) {
+            if (ctx->msg->id == MSG_TX_MEASURE_RTT_START) {
+              /* send measure rtt */
               struct timespec tp = {};
-              clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
+              clock_gettime(CLOCK_MONOTONIC, &tp);
+              uint64_t now = tp.tv_sec * 1e9 + tp.tv_nsec;
+              struct msg rtt_msg = {
+                  .id = MSG_RX_MEASURE_RTT,
+                  .data.measure_rtt.timestamp = now,
+              };
+              rdma_post_send(ctx->cma_id, NULL, &rtt_msg, sizeof(rtt_msg), NULL,
+                             IBV_SEND_INLINE);
+              rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg),
+                             ctx->msg_mr);
+            } else if (ctx->msg->id == MSG_TX_MEASURE_RTT_DONE) {
+              struct timespec tp = {};
+              clock_gettime(CLOCK_MONOTONIC, &tp);
               uint64_t now = tp.tv_sec * 1e9 + tp.tv_nsec;
               uint64_t request_time = ctx->msg->data.measure_rtt.timestamp;
-              uint64_t rtt = now - request_time;
+              rtt = now - request_time;
               printf("rtt: %lu ns\n", rtt);
-              /* start request first frame */
               post_frame_recv(ctx);
-            }
-            if (ctx->msg->id == MSG_TX_FRAME_DONE) {
+            } else if (ctx->msg->id == MSG_TX_FRAME_DONE) {
               /* done */
               struct timespec tp = {};
-              clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
+              clock_gettime(CLOCK_MONOTONIC, &tp);
               uint64_t now = tp.tv_sec * 1e9 + tp.tv_nsec;
               uint64_t request_time = ctx->msg->data.frame.timestamp;
               uint64_t round_latency = now - request_time;
-              if (ctx->recv_count > 0 && round_latency < 1e9 /* 1s */) {
+              if (round_latency < 1e9 /* 1s */) {
                 ctx->round_latency_min = round_latency < ctx->round_latency_min
                                              ? round_latency
                                              : ctx->round_latency_min;
@@ -283,6 +290,7 @@ int main(int argc, char **argv) {
               f->status = FRAME_FREE;
               if (ctx->recv_count == ctx->num_frames)
                 goto out;
+
               post_frame_recv(ctx);
             }
           }
@@ -295,7 +303,7 @@ int main(int argc, char **argv) {
 out:
   /* print statistics */
   if (ctx->round_latency_cnt)
-    printf("round_latency: avg %lu, min %lu, max %lu\n",
+    printf("rtt: %lu, round_latency: avg %lu, min %lu, max %lu\n", rtt,
            ctx->round_latency_sum / ctx->round_latency_cnt,
            ctx->round_latency_min, ctx->round_latency_max);
 

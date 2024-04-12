@@ -148,6 +148,7 @@ int main(int argc, char **argv) {
         init_qp_attr.cap.max_recv_wr = 10;
         init_qp_attr.cap.max_send_sge = 1;
         init_qp_attr.cap.max_recv_sge = 1;
+        init_qp_attr.cap.max_inline_data = sizeof(struct msg);
         init_qp_attr.send_cq = ctx->cq;
         init_qp_attr.recv_cq = ctx->cq;
         init_qp_attr.qp_type = IBV_QPT_RC;

@@ -8,7 +8,13 @@
 
 const int FRAME_BUFFER_CNT = 2;
 
-enum msg_id { MSG_NONE = 0, MSG_RX_FRAME_READY, MSG_TX_FRAME_DONE };
+enum msg_id {
+  MSG_NONE = 0,
+  MSG_RX_FRAME_READY,
+  MSG_TX_FRAME_DONE,
+  MSG_RX_MEASURE_RTT,
+  MSG_TX_MEASURE_RTT,
+};
 
 struct msg {
   int id;
@@ -19,6 +25,9 @@ struct msg {
       uint32_t rkey;
       uint64_t timestamp;
     } frame;
+    struct {
+      uint64_t timestamp;
+    } measure_rtt;
   } data;
 };
 

@@ -58,7 +58,7 @@ static int post_frame_recv(struct ctx *ctx) {
     return -1;
   }
   struct timespec tp = {};
-  clock_gettime(CLOCK_REALTIME, &tp);
+  clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
   /* send frame_ready to tx */
   struct msg rd_msg = {};
   rd_msg.id = MSG_RX_FRAME_READY;
@@ -189,7 +189,7 @@ int main(int argc, char **argv) {
           goto out;
         }
 
-        ctx->msg = malloc(sizeof(*ctx->msg));
+        ctx->msg = calloc(1, sizeof(*ctx->msg));
         if (!ctx->msg) {
           fprintf(stderr, "malloc msg failed\n");
           goto out;
@@ -214,7 +214,17 @@ int main(int argc, char **argv) {
 
         printf("Accepted, start receiving...\n");
 
-        post_frame_recv(ctx);
+        /* send measure rtt */
+        struct timespec tp = {};
+        clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
+        struct msg rtt_msg = {};
+        rtt_msg.id = MSG_RX_MEASURE_RTT;
+        rtt_msg.data.measure_rtt.timestamp = tp.tv_sec * 1e9 + tp.tv_nsec;
+        rdma_post_send(ctx->cma_id, NULL, &rtt_msg, sizeof(rtt_msg), NULL,
+                       IBV_SEND_INLINE);
+        /* post recv rtt msg from tx */
+        rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg),
+                       ctx->msg_mr);
 
         /* poll cq */
         struct ibv_wc wc;
@@ -235,11 +245,20 @@ int main(int argc, char **argv) {
                     wc.vendor_err, wc.qp_num);
           }
           if (wc.opcode == IBV_WC_RECV) {
-            /* check msg */
+            if (ctx->msg->id == MSG_TX_MEASURE_RTT) {
+              struct timespec tp = {};
+              clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
+              uint64_t now = tp.tv_sec * 1e9 + tp.tv_nsec;
+              uint64_t request_time = ctx->msg->data.measure_rtt.timestamp;
+              uint64_t rtt = now - request_time;
+              printf("rtt: %lu ns\n", rtt);
+              /* start request first frame */
+              post_frame_recv(ctx);
+            }
             if (ctx->msg->id == MSG_TX_FRAME_DONE) {
               /* done */
               struct timespec tp = {};
-              clock_gettime(CLOCK_REALTIME, &tp);
+              clock_gettime(CLOCK_MONOTONIC_RAW, &tp);
               uint64_t now = tp.tv_sec * 1e9 + tp.tv_nsec;
               uint64_t request_time = ctx->msg->data.frame.timestamp;
               uint64_t round_latency = now - request_time;
@@ -275,9 +294,10 @@ int main(int argc, char **argv) {
 
 out:
   /* print statistics */
-  printf("round_latency: avg %lu, min %lu, max %lu\n",
-         ctx->round_latency_sum / ctx->round_latency_cnt,
-         ctx->round_latency_min, ctx->round_latency_max);
+  if (ctx->round_latency_cnt)
+    printf("round_latency: avg %lu, min %lu, max %lu\n",
+           ctx->round_latency_sum / ctx->round_latency_cnt,
+           ctx->round_latency_min, ctx->round_latency_max);
 
   rdma_ack_cm_event(event);
   if (ctx->msg_mr)

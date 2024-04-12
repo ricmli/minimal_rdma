@@ -157,7 +157,7 @@ int main(int argc, char **argv) {
           goto out;
         }
 
-        ctx->msg = malloc(sizeof(*ctx->msg));
+        ctx->msg = calloc(1, sizeof(*ctx->msg));
         if (!ctx->msg) {
           fprintf(stderr, "malloc msg failed\n");
           goto out;
@@ -198,7 +198,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  /* wait for a ready message */
+  /* wait for a rtt message */
   rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg), ctx->msg_mr);
 
   /* poll cq */
@@ -219,41 +219,23 @@ int main(int argc, char **argv) {
               wc.qp_num);
     }
     if (wc.opcode == IBV_WC_RECV) {
-      /* check msg */
+      if (ctx->msg->id == MSG_RX_MEASURE_RTT) {
+        struct msg rtt_msg = {
+            .id = MSG_TX_MEASURE_RTT,
+            .data.measure_rtt.timestamp = ctx->msg->data.measure_rtt.timestamp,
+        };
+        rdma_post_send(ctx->cma_id, NULL, &rtt_msg, sizeof(rtt_msg), NULL,
+                       IBV_SEND_INLINE);
+        /* wait for a ready message */
+        rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg),
+                       ctx->msg_mr);
+      }
       if (ctx->msg->id == MSG_RX_FRAME_READY) {
         /* write the frame */
-        struct ibv_send_wr wr = {}, *bad_wr = NULL;
-        struct ibv_sge sge;
-
-        struct timespec tp = {};
-        clock_gettime(CLOCK_REALTIME, &tp);
-        uint64_t send_time = tp.tv_sec * 1e9 + tp.tv_nsec;
-        uint64_t request_time = ctx->msg->data.frame.timestamp;
-        uint64_t request_elapsed = send_time - request_time;
-
-        if (sent > 1 && request_elapsed < 1e6 /* 10 ms */) {
-          ctx->request_elapsed_min = request_elapsed < ctx->request_elapsed_min
-                                         ? request_elapsed
-                                         : ctx->request_elapsed_min;
-          ctx->request_elapsed_max = request_elapsed > ctx->request_elapsed_max
-                                         ? request_elapsed
-                                         : ctx->request_elapsed_max;
-          ctx->request_elapsed_sum += request_elapsed;
-          ctx->request_elapsed_cnt++;
-          printf("request elapsed: %lu ns\n", request_elapsed);
-        }
-
-        wr.wr_id = ctx->msg->data.frame.addr;
-        wr.opcode = IBV_WR_RDMA_WRITE;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = ctx->msg->data.frame.addr;
-        wr.wr.rdma.rkey = ctx->msg->data.frame.rkey;
-        sge.addr = (uintptr_t)ctx->frame_region;
-        sge.length = ctx->region_size;
-        sge.lkey = ctx->frame_mr->lkey;
-        ibv_post_send(ctx->qp, &wr, &bad_wr);
+        rdma_post_write(ctx->cma_id, (void *)ctx->msg->data.frame.addr,
+                        ctx->frame_region, ctx->region_size, ctx->frame_mr,
+                        IBV_SEND_SIGNALED, ctx->msg->data.frame.addr,
+                        ctx->msg->data.frame.rkey);
       }
     }
     if (wc.opcode == IBV_WC_RDMA_WRITE) {
@@ -275,11 +257,6 @@ int main(int argc, char **argv) {
   }
 
 out:
-  /* print statistics */
-  printf("request latency: avg %lu, min %lu, max %lu\n",
-         ctx->request_elapsed_sum / ctx->request_elapsed_cnt,
-         ctx->request_elapsed_min, ctx->request_elapsed_max);
-
   if (ctx->msg_mr)
     ibv_dereg_mr(ctx->msg_mr);
   if (ctx->msg)

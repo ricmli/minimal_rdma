@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <threads.h>
 #include <unistd.h>
 
 #include "frame_common.h"
@@ -29,6 +30,7 @@ struct ctx {
   struct ibv_pd *pd;
   struct ibv_cq *cq;
   struct ibv_qp *qp;
+  struct ibv_comp_channel *cc;
 
   struct ibv_mr *frame_mr;
   struct ibv_mr *msg_mr;
@@ -138,9 +140,32 @@ int main(int argc, char **argv) {
           goto out;
         }
 
-        ctx->cq = ibv_create_cq(event->id->verbs, 10, ctx, NULL, 0);
+        if (parsed_args.event) {
+          ctx->cc = ibv_create_comp_channel(event->id->verbs);
+          if (!ctx->cc) {
+            ret = -EIO;
+            fprintf(stderr, "ibv_create_comp_channel failed\n");
+            goto out;
+          }
+        }
+
+        ctx->cq = ibv_create_cq(event->id->verbs, 10, ctx, ctx->cc, 0);
         if (!ctx->cq) {
           fprintf(stderr, "ibv_create_cq failed\n");
+          goto out;
+        }
+
+        if (parsed_args.event) {
+          ret = ibv_req_notify_cq(ctx->cq, 0);
+          if (ret) {
+            fprintf(stderr, "ibv_req_notify_cq failed\n");
+            goto out;
+          }
+        }
+
+        ret = ibv_req_notify_cq(ctx->cq, 0);
+        if (ret) {
+          fprintf(stderr, "ibv_req_notify_cq failed\n");
           goto out;
         }
 
@@ -226,72 +251,85 @@ int main(int argc, char **argv) {
         struct ibv_wc wc;
 
         for (;;) {
-          do {
-            ret = ibv_poll_cq(ctx->cq, 1, &wc);
-          } while (ret == 0);
-          if (ret < 0) {
-            fprintf(stderr, "ibv_poll_cq failed\n");
-            goto out;
+          if (ctx->cc) {
+            struct ibv_cq *cq;
+            void *cq_ctx = NULL;
+            ret = ibv_get_cq_event(ctx->cc, &cq, &cq_ctx);
+            if (ret) {
+              fprintf(stderr, "ibv_get_cq_event failed\n");
+              goto out;
+            }
+            ibv_ack_cq_events(cq, 1);
+            ret = ibv_req_notify_cq(cq, 0);
+            if (ret) {
+              fprintf(stderr, "ibv_req_notify_cq failed\n");
+              goto out;
+            }
           }
-          if (wc.status != IBV_WC_SUCCESS) {
-            fprintf(stderr, "Work completion error: %s\n",
-                    ibv_wc_status_str(wc.status));
-            /* check more info */
-            fprintf(stderr, "wc.vendor_error = 0x%x, wc.qp_num = %u\n",
-                    wc.vendor_err, wc.qp_num);
-          }
-          if (wc.opcode == IBV_WC_RECV) {
-            if (ctx->msg->id == MSG_TX_MEASURE_RTT_START) {
-              /* send measure rtt */
-              struct timespec tp = {};
-              clock_gettime(CLOCK_MONOTONIC, &tp);
-              uint64_t now = tp.tv_sec * 1e9 + tp.tv_nsec;
-              struct msg rtt_msg = {
-                  .id = MSG_RX_MEASURE_RTT,
-                  .data.measure_rtt.timestamp = now,
-              };
-              rdma_post_send(ctx->cma_id, NULL, &rtt_msg, sizeof(rtt_msg), NULL,
-                             IBV_SEND_INLINE);
-              rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg),
-                             ctx->msg_mr);
-            } else if (ctx->msg->id == MSG_TX_MEASURE_RTT_DONE) {
-              struct timespec tp = {};
-              clock_gettime(CLOCK_MONOTONIC, &tp);
-              uint64_t now = tp.tv_sec * 1e9 + tp.tv_nsec;
-              uint64_t request_time = ctx->msg->data.measure_rtt.timestamp;
-              rtt = now - request_time;
-              printf("rtt: %lu ns\n", rtt);
-              post_frame_recv(ctx);
-            } else if (ctx->msg->id == MSG_TX_FRAME_DONE) {
-              /* done */
-              struct timespec tp = {};
-              clock_gettime(CLOCK_MONOTONIC, &tp);
-              uint64_t now = tp.tv_sec * 1e9 + tp.tv_nsec;
-              uint64_t request_time = ctx->msg->data.frame.timestamp;
-              uint64_t round_latency = now - request_time;
-              if (round_latency < 1e9 /* 1s */) {
-                ctx->round_latency_min = round_latency < ctx->round_latency_min
-                                             ? round_latency
-                                             : ctx->round_latency_min;
-                ctx->round_latency_max = round_latency > ctx->round_latency_max
-                                             ? round_latency
-                                             : ctx->round_latency_max;
-                ctx->round_latency_sum += round_latency;
-                ctx->round_latency_cnt++;
-                printf("frame %d, round latency %lu ns\n", ctx->recv_count,
-                       round_latency);
+          while (ibv_poll_cq(ctx->cq, 1, &wc)) {
+            if (wc.status != IBV_WC_SUCCESS) {
+              fprintf(stderr, "Work completion error: %s\n",
+                      ibv_wc_status_str(wc.status));
+              /* check more info */
+              fprintf(stderr, "wc.vendor_error = 0x%x, wc.qp_num = %u\n",
+                      wc.vendor_err, wc.qp_num);
+              goto out;
+            }
+            if (wc.opcode == IBV_WC_RECV) {
+              if (ctx->msg->id == MSG_TX_MEASURE_RTT_START) {
+                /* send measure rtt */
+                struct timespec tp = {};
+                clock_gettime(CLOCK_MONOTONIC, &tp);
+                uint64_t now = tp.tv_sec * 1e9 + tp.tv_nsec;
+                struct msg rtt_msg = {
+                    .id = MSG_RX_MEASURE_RTT,
+                    .data.measure_rtt.timestamp = now,
+                };
+                rdma_post_send(ctx->cma_id, NULL, &rtt_msg, sizeof(rtt_msg),
+                               NULL, IBV_SEND_INLINE);
+                rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg),
+                               ctx->msg_mr);
+              } else if (ctx->msg->id == MSG_TX_MEASURE_RTT_DONE) {
+                struct timespec tp = {};
+                clock_gettime(CLOCK_MONOTONIC, &tp);
+                uint64_t now = tp.tv_sec * 1e9 + tp.tv_nsec;
+                uint64_t request_time = ctx->msg->data.measure_rtt.timestamp;
+                rtt = now - request_time;
+                printf("rtt: %lu ns\n", rtt);
+                post_frame_recv(ctx);
+              } else if (ctx->msg->id == MSG_TX_FRAME_DONE) {
+                /* done */
+                struct timespec tp = {};
+                clock_gettime(CLOCK_MONOTONIC, &tp);
+                uint64_t now = tp.tv_sec * 1e9 + tp.tv_nsec;
+                uint64_t request_time = ctx->msg->data.frame.timestamp;
+                uint64_t round_latency = now - request_time;
+                if (round_latency < 1e9 /* 1s */) {
+                  ctx->round_latency_min =
+                      round_latency < ctx->round_latency_min
+                          ? round_latency
+                          : ctx->round_latency_min;
+                  ctx->round_latency_max =
+                      round_latency > ctx->round_latency_max
+                          ? round_latency
+                          : ctx->round_latency_max;
+                  ctx->round_latency_sum += round_latency;
+                  ctx->round_latency_cnt++;
+                  printf("frame %d, round latency %lu ns\n", ctx->recv_count,
+                         round_latency);
+                }
+                struct frame *f = (struct frame *)wc.wr_id;
+                f->status = FRAME_DONE_WRITING;
+                ctx->recv_count++;
+
+                /* pretend to use it */
+                usleep(200000);
+                f->status = FRAME_FREE;
+                if (ctx->recv_count == ctx->num_frames)
+                  goto out;
+
+                post_frame_recv(ctx);
               }
-              struct frame *f = (struct frame *)wc.wr_id;
-              f->status = FRAME_DONE_WRITING;
-              ctx->recv_count++;
-
-              /* pretend to use it */
-              usleep(200000);
-              f->status = FRAME_FREE;
-              if (ctx->recv_count == ctx->num_frames)
-                goto out;
-
-              post_frame_recv(ctx);
             }
           }
         }
@@ -303,7 +341,7 @@ int main(int argc, char **argv) {
 out:
   /* print statistics */
   if (ctx->round_latency_cnt)
-    printf("rtt: %lu, round_latency: avg %lu, min %lu, max %lu\n", rtt,
+    printf("msg rtt: %lu, frame latency: avg %lu, min %lu, max %lu\n", rtt,
            ctx->round_latency_sum / ctx->round_latency_cnt,
            ctx->round_latency_min, ctx->round_latency_max);
 
@@ -320,6 +358,8 @@ out:
     ibv_destroy_qp(ctx->qp);
   if (ctx->cq)
     ibv_destroy_cq(ctx->cq);
+  if (ctx->cc)
+    ibv_destroy_comp_channel(ctx->cc);
   if (ctx->pd)
     ibv_dealloc_pd(ctx->pd);
   if (rai)

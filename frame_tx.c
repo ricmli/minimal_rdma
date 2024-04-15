@@ -27,6 +27,7 @@ struct ctx {
   struct ibv_pd *pd;
   struct ibv_cq *cq;
   struct ibv_qp *qp;
+  struct ibv_comp_channel *cc;
 
   struct ibv_mr *frame_mr;
   struct ibv_mr *msg_mr;
@@ -117,10 +118,27 @@ int main(int argc, char **argv) {
           goto out;
         }
 
-        ctx->cq = ibv_create_cq(event->id->verbs, 10, ctx, NULL, 0);
+        if (parsed_args.event) {
+          ctx->cc = ibv_create_comp_channel(event->id->verbs);
+          if (!ctx->cc) {
+            ret = -EIO;
+            fprintf(stderr, "ibv_create_comp_channel failed\n");
+            goto out;
+          }
+        }
+
+        ctx->cq = ibv_create_cq(event->id->verbs, 10, ctx, ctx->cc, 0);
         if (!ctx->cq) {
           fprintf(stderr, "ibv_create_cq failed\n");
           goto out;
+        }
+
+        if (parsed_args.event) {
+          ret = ibv_req_notify_cq(ctx->cq, 0);
+          if (ret) {
+            fprintf(stderr, "ibv_req_notify_cq failed\n");
+            goto out;
+          }
         }
 
         struct ibv_qp_init_attr init_qp_attr = {
@@ -215,53 +233,65 @@ int main(int argc, char **argv) {
   /* poll cq */
   struct ibv_wc wc;
   for (;;) {
-    do {
-      ret = ibv_poll_cq(ctx->cq, 1, &wc);
-    } while (ret == 0);
-    if (ret < 0) {
-      fprintf(stderr, "ibv_poll_cq failed\n");
-      goto out;
-    }
-    if (wc.status != IBV_WC_SUCCESS) {
-      fprintf(stderr, "Work completion error: %s\n",
-              ibv_wc_status_str(wc.status));
-      /* check more info */
-      fprintf(stderr, "wc.vendor_error = 0x%x, wc.qp_num = %u\n", wc.vendor_err,
-              wc.qp_num);
-    }
-    if (wc.opcode == IBV_WC_RECV) {
-      if (ctx->msg->id == MSG_RX_MEASURE_RTT) {
-        struct msg rtt_msg = {
-            .id = MSG_TX_MEASURE_RTT_DONE,
-            .data.measure_rtt.timestamp = ctx->msg->data.measure_rtt.timestamp,
-        };
-        rdma_post_send(ctx->cma_id, NULL, &rtt_msg, sizeof(rtt_msg), NULL,
-                       IBV_SEND_INLINE);
-        printf("Start sending:\n");
-      } else if (ctx->msg->id == MSG_RX_FRAME_READY) {
-        /* write the frame */
-        rdma_post_write(ctx->cma_id, (void *)ctx->msg->data.frame.addr,
-                        ctx->frame_region, ctx->region_size, ctx->frame_mr,
-                        IBV_SEND_SIGNALED, ctx->msg->data.frame.addr,
-                        ctx->msg->data.frame.rkey);
-      }
-      /* wait for next message */
-      rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg),
-                     ctx->msg_mr);
-    } else if (wc.opcode == IBV_WC_RDMA_WRITE) {
-      /* write done, send done msg */
-      struct msg td_msg = {
-          .id = MSG_TX_FRAME_DONE,
-          .data.frame.addr = wc.wr_id,
-          .data.frame.timestamp = ctx->msg->data.frame.timestamp,
-      };
-      rdma_post_send(ctx->cma_id, NULL, &td_msg, sizeof(td_msg), NULL,
-                     IBV_SEND_INLINE);
-      sent++;
-      printf(".");
-      fflush(stdout);
-      if (sent >= ctx->num_frames)
+    if (ctx->cc) {
+      struct ibv_cq *cq;
+      void *cq_ctx = NULL;
+      ret = ibv_get_cq_event(ctx->cc, &cq, &cq_ctx);
+      if (ret) {
+        fprintf(stderr, "ibv_get_cq_event failed\n");
         goto out;
+      }
+      ibv_ack_cq_events(cq, 1);
+      ret = ibv_req_notify_cq(cq, 0);
+      if (ret) {
+        fprintf(stderr, "ibv_req_notify_cq failed\n");
+        goto out;
+      }
+    }
+    while (ibv_poll_cq(ctx->cq, 1, &wc)) {
+      if (wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "Work completion error: %s\n",
+                ibv_wc_status_str(wc.status));
+        /* check more info */
+        fprintf(stderr, "wc.vendor_error = 0x%x, wc.qp_num = %u\n",
+                wc.vendor_err, wc.qp_num);
+        goto out;
+      }
+      if (wc.opcode == IBV_WC_RECV) {
+        if (ctx->msg->id == MSG_RX_MEASURE_RTT) {
+          struct msg rtt_msg = {
+              .id = MSG_TX_MEASURE_RTT_DONE,
+              .data.measure_rtt.timestamp =
+                  ctx->msg->data.measure_rtt.timestamp,
+          };
+          rdma_post_send(ctx->cma_id, NULL, &rtt_msg, sizeof(rtt_msg), NULL,
+                         IBV_SEND_INLINE);
+          printf("Start sending:\n");
+        } else if (ctx->msg->id == MSG_RX_FRAME_READY) {
+          /* write the frame */
+          rdma_post_write(ctx->cma_id, (void *)ctx->msg->data.frame.addr,
+                          ctx->frame_region, ctx->region_size, ctx->frame_mr,
+                          IBV_SEND_SIGNALED, ctx->msg->data.frame.addr,
+                          ctx->msg->data.frame.rkey);
+        }
+        /* wait for next message */
+        rdma_post_recv(ctx->cma_id, NULL, ctx->msg, sizeof(*ctx->msg),
+                       ctx->msg_mr);
+      } else if (wc.opcode == IBV_WC_RDMA_WRITE) {
+        /* write done, send done msg */
+        struct msg td_msg = {
+            .id = MSG_TX_FRAME_DONE,
+            .data.frame.addr = wc.wr_id,
+            .data.frame.timestamp = ctx->msg->data.frame.timestamp,
+        };
+        rdma_post_send(ctx->cma_id, NULL, &td_msg, sizeof(td_msg), NULL,
+                       IBV_SEND_INLINE);
+        sent++;
+        printf(".");
+        fflush(stdout);
+        if (sent >= ctx->num_frames)
+          goto out;
+      }
     }
   }
 
@@ -279,6 +309,8 @@ out:
     rdma_destroy_qp(ctx->cma_id);
   if (ctx->cq)
     ibv_destroy_cq(ctx->cq);
+  if (ctx->cc)
+    ibv_destroy_comp_channel(ctx->cc);
   if (ctx->pd)
     ibv_dealloc_pd(ctx->pd);
   if (rai)

@@ -1,6 +1,7 @@
 #ifndef FRAME_COMMON_H
 #define FRAME_COMMON_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +42,7 @@ typedef struct {
   int frame_width;         // Frame width
   int frame_height;        // Frame height
   int bit_depth;           // Bit depth
+  bool event;              // Event notify or poll
 } Args;
 
 // Function to print help message and exit
@@ -53,14 +55,15 @@ static void print_help_and_exit(const char *argv0) {
          "  -w <pixels>        Set the frame width in pixels\n"
          "  -h <pixels>        Set the frame height in pixels\n"
          "  -d <bits>          Set the bit depth of the frames\n"
-         "  -H                  Display this help message\n",
+         "  -e                 Use cq event notify for messages\n"
+         "  -H                 Display this help message\n",
          argv0);
   exit(EXIT_SUCCESS);
 }
 
 // Parse command line arguments function
 static Args parse_args(int argc, char *argv[]) {
-  Args args = {NULL, NULL, 0, 0, 0, 0, 0}; // Initialize Args struct
+  Args args = {NULL, NULL, 0, 0, 0, 0, 0, false}; // Initialize Args struct
 
   for (int i = 1; i < argc; i++) {
     if (argv[i][0] == '-') {
@@ -123,6 +126,9 @@ static Args parse_args(int argc, char *argv[]) {
         break;
       case 'H': // -H for help
         print_help_and_exit(argv[0]);
+        break;
+      case 'e':
+        args.event = true;
         break;
       default:
         fprintf(stderr, "Error: Unknown option '-%c'.\n", argv[i][1]);
